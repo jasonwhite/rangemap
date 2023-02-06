@@ -341,13 +341,13 @@ pub struct Gaps<'a, T> {
 }
 
 // `Gaps` is always fused. (See definition of `next` below.)
-impl<'a, T> core::iter::FusedIterator for Gaps<'a, T> where T: Ord + Clone {}
+impl<'a, T> core::iter::FusedIterator for Gaps<'a, T> where T: Ord {}
 
 impl<'a, T> Iterator for Gaps<'a, T>
 where
-    T: Ord + Clone,
+    T: Ord,
 {
-    type Item = Range<T>;
+    type Item = Range<&'a T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
@@ -433,9 +433,9 @@ mod tests {
         let mut gaps = range_set.gaps(&outer_range);
         // Should yield gaps at start, between items,
         // and at end.
-        assert_eq!(gaps.next(), Some(1..3));
-        assert_eq!(gaps.next(), Some(4..5));
-        assert_eq!(gaps.next(), Some(6..8));
+        assert_eq!(gaps.next(), Some(&1..&3));
+        assert_eq!(gaps.next(), Some(&4..&5));
+        assert_eq!(gaps.next(), Some(&6..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);

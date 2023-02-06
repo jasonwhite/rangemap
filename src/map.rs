@@ -650,13 +650,13 @@ pub struct Gaps<'a, K, V> {
 }
 
 // `Gaps` is always fused. (See definition of `next` below.)
-impl<'a, K, V> core::iter::FusedIterator for Gaps<'a, K, V> where K: Ord + Clone {}
+impl<'a, K, V> core::iter::FusedIterator for Gaps<'a, K, V> where K: Ord {}
 
 impl<'a, K, V> Iterator for Gaps<'a, K, V>
 where
-    K: Ord + Clone,
+    K: Ord,
 {
-    type Item = Range<K>;
+    type Item = Range<&'a K>;
 
     fn next(&mut self) -> Option<Self::Item> {
         for item in &mut self.keys {
@@ -669,7 +669,7 @@ where
             } else if range.start < self.outer_range.end {
                 // It starts before the end of the outer range,
                 // so move past it and then yield a gap.
-                let gap = self.candidate_start.clone()..range.start.clone();
+                let gap = self.candidate_start..&range.start;
                 self.candidate_start = &range.end;
                 return Some(gap);
             }
@@ -679,7 +679,7 @@ where
         // gap is at the end of the outer range.
         if *self.candidate_start < self.outer_range.end {
             // There's a gap at the end!
-            let gap = self.candidate_start.clone()..self.outer_range.end.clone();
+            let gap = self.candidate_start..&self.outer_range.end;
             // We're done; skip to the end so we don't try to find any more.
             self.candidate_start = &self.outer_range.end;
             Some(gap)
@@ -1043,7 +1043,7 @@ mod tests {
         let outer_range = 1..8;
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield the entire outer range.
-        assert_eq!(gaps.next(), Some(1..8));
+        assert_eq!(gaps.next(), Some(&1..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1078,7 +1078,7 @@ mod tests {
         let outer_range = 5..8;
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield the entire outer range.
-        assert_eq!(gaps.next(), Some(5..8));
+        assert_eq!(gaps.next(), Some(&5..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1096,7 +1096,7 @@ mod tests {
         let outer_range = 5..8;
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield the entire outer range.
-        assert_eq!(gaps.next(), Some(5..8));
+        assert_eq!(gaps.next(), Some(&5..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1115,7 +1115,7 @@ mod tests {
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield from the end of the stored item
         // to the end of the outer range.
-        assert_eq!(gaps.next(), Some(6..8));
+        assert_eq!(gaps.next(), Some(&6..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1133,7 +1133,7 @@ mod tests {
         let outer_range = 5..8;
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield from the item onwards.
-        assert_eq!(gaps.next(), Some(6..8));
+        assert_eq!(gaps.next(), Some(&6..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1155,9 +1155,9 @@ mod tests {
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield gaps at start, between items,
         // and at end.
-        assert_eq!(gaps.next(), Some(1..3));
-        assert_eq!(gaps.next(), Some(4..5));
-        assert_eq!(gaps.next(), Some(6..8));
+        assert_eq!(gaps.next(), Some(&1..&3));
+        assert_eq!(gaps.next(), Some(&4..&5));
+        assert_eq!(gaps.next(), Some(&6..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1176,7 +1176,7 @@ mod tests {
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield from the start of the outer range
         // up to the start of the stored item.
-        assert_eq!(gaps.next(), Some(5..7));
+        assert_eq!(gaps.next(), Some(&5..&7));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1195,7 +1195,7 @@ mod tests {
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield from the start of the outer range
         // up to the start of the stored item.
-        assert_eq!(gaps.next(), Some(2..4));
+        assert_eq!(gaps.next(), Some(&2..&4));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1213,7 +1213,7 @@ mod tests {
         let outer_range = 1..4;
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield the entire outer range.
-        assert_eq!(gaps.next(), Some(1..4));
+        assert_eq!(gaps.next(), Some(&1..&4));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1231,7 +1231,7 @@ mod tests {
         let outer_range = 1..4;
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield the entire outer range.
-        assert_eq!(gaps.next(), Some(1..4));
+        assert_eq!(gaps.next(), Some(&1..&4));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1311,8 +1311,8 @@ mod tests {
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield gaps at start and end, but not between the
         // two touching items. (4 is covered, so there should be no gap.)
-        assert_eq!(gaps.next(), Some(1..3));
-        assert_eq!(gaps.next(), Some(5..8));
+        assert_eq!(gaps.next(), Some(&1..&3));
+        assert_eq!(gaps.next(), Some(&5..&8));
         assert_eq!(gaps.next(), None);
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
@@ -1331,7 +1331,7 @@ mod tests {
         let outer_range = 0..255;
         let mut gaps = range_map.gaps(&outer_range);
         // Should yield one big gap in the middle.
-        assert_eq!(gaps.next(), Some(2..253));
+        assert_eq!(gaps.next(), Some(&2..&253));
         // Gaps iterator should be fused.
         assert_eq!(gaps.next(), None);
         assert_eq!(gaps.next(), None);
