@@ -28,6 +28,15 @@ pub struct RangeMap<K, V> {
     pub(crate) btm: BTreeMap<RangeStartWrapper<K>, V>,
 }
 
+pub enum MaybeSplit<'a, V> {
+    /// The range needs to be split. Give a reference to one side of the split,
+    /// so it can be cloned.
+    Split(&'a V),
+    /// The range size needs to be reduced. Allow the user to get ownership and
+    /// remap the value.
+    Reduced(V),
+}
+
 impl<K, V> Default for RangeMap<K, V> {
     fn default() -> Self {
         Self::new()
@@ -212,6 +221,18 @@ where
     ///
     /// Panics if range `start >= end`.
     pub fn insert(&mut self, range: Range<K>, value: V) {
+        self.insert_with(range, value, |v| {
+            match v {
+                MaybeSplit::Split(v) => v.clone(),
+                MaybeSplit::Reduced(v) => v,
+            }
+        })
+    }
+
+    fn insert_with<F>(&mut self, range: Range<K>, value: V, mut f: F)
+    where
+        F: FnMut(MaybeSplit<V>) -> V,
+    {
         // We don't want to have to make empty ranges make sense;
         // they don't represent anything meaningful in this structure.
         assert!(range.start < range.end);
@@ -219,7 +240,7 @@ where
         // Wrap up the given range so that we can "borrow"
         // it as a wrapper reference to either its start or end.
         // See `range_wrapper.rs` for explanation of these hacks.
-        let mut new_start_wrapper: RangeStartWrapper<K> = RangeStartWrapper::new(range);
+        let mut new_start_wrapper = RangeStartWrapper::new(range);
         let new_value = value;
 
         // Is there a stored range either overlapping the start of
@@ -228,9 +249,9 @@ where
         // If there is any such stored range, it will be the last
         // whose start is less than or equal to the start of the range to insert,
         // or the one before that if both of the above cases exist.
-        let mut candidates = self
+        let candidates = self
             .btm
-            .range::<RangeStartWrapper<K>, (Bound<&RangeStartWrapper<K>>, Bound<&RangeStartWrapper<K>>)>((
+            .range::<RangeStartWrapper<K>, _>((
                 Bound::Unbounded,
                 Bound::Included(&new_start_wrapper),
             ))
@@ -246,17 +267,22 @@ where
                     .range
                     .touches(&new_start_wrapper.end_wrapper.range)
             });
-        if let Some(mut candidate) = candidates.next() {
-            // Or the one before it if both cases described above exist.
-            if let Some(another_candidate) = candidates.next() {
-                candidate = another_candidate;
-            }
-            let (stored_start_wrapper, stored_value) = (candidate.0.clone(), candidate.1.clone());
+
+        // NOTE: We will have two candidates if there are two ranges touching
+        // the start of the range to be inserted. In this case, there will be
+        // one range immediately adjacent to the inserted range and one range
+        // that has its start inside of the inserted range. The second case will
+        // be handled further below. Thus, we use `.last()` to get the adjacent
+        // range and handle only that one.
+        if let Some((candidate_range, candidate_value)) = candidates.last() {
+            // FIXME: Avoid cloning of the candidate's value. I think this can
+            // only be done with the forthcoming BTreeMap cursors API.
             self.adjust_touching_ranges_for_insert(
-                stored_start_wrapper,
-                stored_value,
+                candidate_range.clone(),
+                candidate_value.clone(),
                 &mut new_start_wrapper.end_wrapper.range,
                 &new_value,
+                &mut f
             );
         }
 
@@ -278,7 +304,7 @@ where
         );
         while let Some((stored_start_wrapper, stored_value)) = self
             .btm
-            .range::<RangeStartWrapper<K>, (Bound<&RangeStartWrapper<K>>, Bound<&RangeStartWrapper<K>>)>((
+            .range::<RangeStartWrapper<K>, _>((
                 Bound::Included(&new_start_wrapper),
                 Bound::Included(&new_range_end_as_start),
             ))
@@ -300,14 +326,12 @@ where
                 break;
             }
 
-            let stored_start_wrapper = stored_start_wrapper.clone();
-            let stored_value = stored_value.clone();
-
             self.adjust_touching_ranges_for_insert(
-                stored_start_wrapper,
-                stored_value,
+                stored_start_wrapper.clone(),
+                stored_value.clone(),
                 &mut new_start_wrapper.end_wrapper.range,
                 &new_value,
+                &mut f,
             );
         }
 
@@ -330,7 +354,7 @@ where
         // they don't represent anything meaningful in this structure.
         assert!(range.start < range.end);
 
-        let start_wrapper: RangeStartWrapper<K> = RangeStartWrapper::new(range);
+        let start_wrapper = RangeStartWrapper::new(range);
         let range = &start_wrapper.end_wrapper.range;
 
         // Is there a stored range overlapping the start of
@@ -389,13 +413,17 @@ where
         }
     }
 
-    fn adjust_touching_ranges_for_insert(
+    fn adjust_touching_ranges_for_insert<F>(
         &mut self,
         stored_start_wrapper: RangeStartWrapper<K>,
         stored_value: V,
         new_range: &mut Range<K>,
         new_value: &V,
-    ) {
+        mut f: F,
+    )
+    where
+        F: FnMut(MaybeSplit<V>) -> V,
+    {
         use core::cmp::{max, min};
 
         if stored_value == *new_value {
@@ -408,34 +436,41 @@ where
             new_range.start = min(&new_range.start, &stored_start_wrapper.start).clone();
             new_range.end = max(&new_range.end, &stored_start_wrapper.end).clone();
             self.btm.remove(&stored_start_wrapper);
-        } else {
-            // The ranges have different values.
-            if new_range.overlaps(&stored_start_wrapper.range) {
-                // The ranges overlap. This is a little bit more complicated.
-                // Delete the stored range, and then add back between
-                // 0 and 2 subranges at the ends of the range to insert.
-                self.btm.remove(&stored_start_wrapper);
-                if stored_start_wrapper.start < new_range.start {
-                    // Insert the piece left of the range to insert.
-                    self.btm.insert(
-                        RangeStartWrapper::new(
-                            stored_start_wrapper.end_wrapper.range.start..new_range.start.clone(),
-                        ),
-                        stored_value.clone(),
-                    );
-                }
+        } else if new_range.overlaps(&stored_start_wrapper.range) {
+            // The ranges overlap. This is a little bit more complicated.
+            // Delete the stored range, and then add back between
+            // 0 and 2 subranges at the ends of the range to insert.
+            let new_value = self.btm.remove(&stored_start_wrapper).unwrap();
+
+            if stored_start_wrapper.start < new_range.start {
                 if stored_start_wrapper.end_wrapper.range.end > new_range.end {
-                    // Insert the piece right of the range to insert.
+                    // Insert the right side, which is the result of the split.
+                    //
+                    // FIXME: Before inserting the value, need to check if it is
+                    // the same as any ranges touching this one.
                     self.btm.insert(
                         RangeStartWrapper::new(
                             new_range.end.clone()..stored_start_wrapper.end_wrapper.range.end,
                         ),
-                        stored_value,
+                        f(MaybeSplit::Split(&new_value)),
                     );
                 }
-            } else {
-                // No-op; they're not overlapping,
-                // so we can just keep both ranges as they are.
+
+                // Insert the piece left of the range to insert.
+                self.btm.insert(
+                    RangeStartWrapper::new(
+                        stored_start_wrapper.end_wrapper.range.start..new_range.start.clone(),
+                    ),
+                    f(MaybeSplit::Reduced(new_value)),
+                );
+            } else if stored_start_wrapper.end_wrapper.range.end > new_range.end {
+                // Insert the piece right of the range to insert.
+                self.btm.insert(
+                    RangeStartWrapper::new(
+                        new_range.end.clone()..stored_start_wrapper.end_wrapper.range.end,
+                    ),
+                    f(MaybeSplit::Reduced(new_value)),
+                );
             }
         }
     }

@@ -1,7 +1,12 @@
 use core::ops::{Add, Range, RangeInclusive, Sub};
 
 pub trait RangeExt<T> {
+    /// Returns true if thsi range is overlapping with the other range. Ranges
+    /// are overlapping if one of the ends of the range is inside of the other.
     fn overlaps(&self, other: &Self) -> bool;
+
+    /// Returns true if this range is "touching" the other range. Ranges are
+    /// touching if they are either overlapping or are immediately adjacent.
     fn touches(&self, other: &Self) -> bool;
 }
 
