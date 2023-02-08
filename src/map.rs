@@ -16,6 +16,12 @@ use serde::{
     ser::{Serialize, Serializer},
 };
 
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct Inner<K, V> {
+    end: K,
+    value: V,
+}
+
 /// A map whose keys are stored as (half-open) ranges bounded
 /// inclusively below and exclusively above `(start..end)`.
 ///
@@ -25,7 +31,7 @@ use serde::{
 pub struct RangeMap<K, V> {
     // Wrap ranges so that they are `Ord`.
     // See `range_wrapper.rs` for explanation.
-    pub(crate) btm: BTreeMap<RangeStartWrapper<K>, V>,
+    btm: BTreeMap<K, Inner<K, V>>,
 }
 
 impl<K, V> Default for RangeMap<K, V> {
@@ -128,19 +134,18 @@ where
 
     /// Returns the range-value pair (as a pair of references) corresponding
     /// to the given key, if the key is covered by any range in the map.
-    pub fn get_key_value(&self, key: &K) -> Option<(&Range<K>, &V)> {
+    pub fn get_key_value(&self, key: &K) -> Option<(Range<&K>, &V)> {
         // The only stored range that could contain the given key is the
         // last stored range whose start is less than or equal to this key.
-        let key_as_start = RangeStartWrapper::new(key.clone()..key.clone());
         self.btm
-            .range((Bound::Unbounded, Bound::Included(key_as_start)))
+            .range((Bound::Unbounded, Bound::Included(key)))
             .next_back()
-            .filter(|(start_wrapper, _value)| {
+            .filter(|(start, inner)| {
                 // Does the only candidate range contain
                 // the requested key?
-                start_wrapper.end_wrapper.range.contains(key)
+                (*start..&inner.end).contains(&key)
             })
-            .map(|(start_wrapper, value)| (&start_wrapper.end_wrapper.range, value))
+            .map(|(start, inner)| (start..&inner.end, &inner.value))
     }
 
     /// Returns `true` if any range in the map covers the specified key.
@@ -211,7 +216,7 @@ where
     /// # Panics
     ///
     /// Panics if range `start >= end`.
-    pub fn insert(&mut self, range: Range<K>, value: V) {
+    pub fn insert(&mut self, mut range: Range<K>, value: V) {
         // We don't want to have to make empty ranges make sense;
         // they don't represent anything meaningful in this structure.
         assert!(range.start < range.end);
@@ -219,7 +224,6 @@ where
         // Wrap up the given range so that we can "borrow"
         // it as a wrapper reference to either its start or end.
         // See `range_wrapper.rs` for explanation of these hacks.
-        let mut new_start_wrapper: RangeStartWrapper<K> = RangeStartWrapper::new(range);
         let new_value = value;
 
         // Is there a stored range either overlapping the start of
@@ -230,32 +234,24 @@ where
         // or the one before that if both of the above cases exist.
         let mut candidates = self
             .btm
-            .range::<RangeStartWrapper<K>, (Bound<&RangeStartWrapper<K>>, Bound<&RangeStartWrapper<K>>)>((
-                Bound::Unbounded,
-                Bound::Included(&new_start_wrapper),
-            ))
+            .range(..=&range.start)
             .rev()
             .take(2)
-            .filter(|(stored_start_wrapper, _stored_value)| {
+            .filter(|(_start, inner)| {
                 // Does the candidate range either overlap
                 // or immediately precede the range to insert?
                 // (Remember that it might actually cover the _whole_
                 // range to insert and then some.)
-                stored_start_wrapper
-                    .end_wrapper
-                    .range
-                    .touches(&new_start_wrapper.end_wrapper.range)
+                inner.end <= range.start
             });
-        if let Some(mut candidate) = candidates.next() {
-            // Or the one before it if both cases described above exist.
-            if let Some(another_candidate) = candidates.next() {
-                candidate = another_candidate;
-            }
-            let (stored_start_wrapper, stored_value) = (candidate.0.clone(), candidate.1.clone());
+        if let Some(mut candidate) = candidates.last() {
+            let stored_range = candidate.0.clone()..candidate.1.end.clone();
+            let stored_value = candidate.1.value.clone();
+
             self.adjust_touching_ranges_for_insert(
-                stored_start_wrapper,
+                stored_range,
                 stored_value,
-                &mut new_start_wrapper.end_wrapper.range,
+                &mut range,
                 &new_value,
             );
         }
@@ -272,26 +268,16 @@ where
         //
         // REVISIT: Possible micro-optimisation: `impl Borrow<T> for RangeStartWrapper<T>`
         // and use that to search here, to avoid constructing another `RangeStartWrapper`.
-        let new_range_end_as_start = RangeStartWrapper::new(
-            new_start_wrapper.end_wrapper.range.end.clone()
-                ..new_start_wrapper.end_wrapper.range.end.clone(),
-        );
-        while let Some((stored_start_wrapper, stored_value)) = self
+        while let Some((stored_start, inner)) = self
             .btm
-            .range::<RangeStartWrapper<K>, (Bound<&RangeStartWrapper<K>>, Bound<&RangeStartWrapper<K>>)>((
-                Bound::Included(&new_start_wrapper),
-                Bound::Included(&new_range_end_as_start),
-            ))
+            .range(&range.start..=&range.end)
             .next()
         {
             // One extra exception: if we have different values,
             // and the stored range starts at the end of the range to insert,
             // then we don't want to keep looping forever trying to find more!
             #[allow(clippy::suspicious_operation_groupings)]
-            if stored_start_wrapper.end_wrapper.range.start
-                == new_start_wrapper.end_wrapper.range.end
-                && *stored_value != new_value
-            {
+            if stored_start == range.end && inner.value != new_value {
                 // We're beyond the last stored range that could be relevant.
                 // Avoid wasting time on irrelevant ranges, or even worse, looping forever.
                 // (`adjust_touching_ranges_for_insert` below assumes that the given range
@@ -300,19 +286,19 @@ where
                 break;
             }
 
-            let stored_start_wrapper = stored_start_wrapper.clone();
-            let stored_value = stored_value.clone();
+            let stored_range = stored_start.clone()..inner.end.clone();
+            let stored_value = inner.value.clone();
 
             self.adjust_touching_ranges_for_insert(
-                stored_start_wrapper,
+                stored_range,
                 stored_value,
-                &mut new_start_wrapper.end_wrapper.range,
+                &mut range,
                 &new_value,
             );
         }
 
         // Insert the (possibly expanded) new range, and we're done!
-        self.btm.insert(new_start_wrapper, new_value);
+        self.btm.insert(range, new_value);
     }
 
     /// Removes a range from the map, if all or any of it was present.
@@ -391,7 +377,7 @@ where
 
     fn adjust_touching_ranges_for_insert(
         &mut self,
-        stored_start_wrapper: RangeStartWrapper<K>,
+        stored_range: Range<K>,
         stored_value: V,
         new_range: &mut Range<K>,
         new_value: &V,
@@ -405,31 +391,27 @@ where
             // This means that no matter how big or where the stored range is,
             // we will expand the new range's bounds to subsume it,
             // and then delete the stored range.
-            new_range.start = min(&new_range.start, &stored_start_wrapper.start).clone();
-            new_range.end = max(&new_range.end, &stored_start_wrapper.end).clone();
-            self.btm.remove(&stored_start_wrapper);
+            new_range.start = min(&new_range.start, &stored_range.start).clone();
+            new_range.end = max(&new_range.end, &stored_range.end).clone();
+            self.btm.remove(&stored_range.start);
         } else {
             // The ranges have different values.
-            if new_range.overlaps(&stored_start_wrapper.range) {
+            if new_range.overlaps(&stored_range) {
                 // The ranges overlap. This is a little bit more complicated.
                 // Delete the stored range, and then add back between
                 // 0 and 2 subranges at the ends of the range to insert.
-                self.btm.remove(&stored_start_wrapper);
-                if stored_start_wrapper.start < new_range.start {
+                self.btm.remove(&stored_range.start);
+                if stored_range.start < new_range.start {
                     // Insert the piece left of the range to insert.
                     self.btm.insert(
-                        RangeStartWrapper::new(
-                            stored_start_wrapper.end_wrapper.range.start..new_range.start.clone(),
-                        ),
+                        stored_range.start..new_range.start.clone(),
                         stored_value.clone(),
                     );
                 }
-                if stored_start_wrapper.end_wrapper.range.end > new_range.end {
+                if stored_range.end > new_range.end {
                     // Insert the piece right of the range to insert.
                     self.btm.insert(
-                        RangeStartWrapper::new(
-                            new_range.end.clone()..stored_start_wrapper.end_wrapper.range.end,
-                        ),
+                        new_range.end.clone()..stored_range.end,
                         stored_value,
                     );
                 }
@@ -442,25 +424,25 @@ where
 
     fn adjust_overlapping_ranges_for_remove(
         &mut self,
-        stored: RangeStartWrapper<K>,
+        stored_range: Range<K>,
         stored_value: V,
         range_to_remove: &Range<K>,
     ) {
         // Delete the stored range, and then add back between
         // 0 and 2 subranges at the ends of the range to insert.
-        self.btm.remove(&stored);
-        let stored_range = stored.end_wrapper;
+        self.btm.remove(&stored_range.start);
+
         if stored_range.start < range_to_remove.start {
             // Insert the piece left of the range to insert.
             self.btm.insert(
-                RangeStartWrapper::new(stored_range.range.start..range_to_remove.start.clone()),
+                stored_range.start..range_to_remove.start.clone(),
                 stored_value.clone(),
             );
         }
-        if stored_range.range.end > range_to_remove.end {
+        if stored_range.end > range_to_remove.end {
             // Insert the piece right of the range to insert.
             self.btm.insert(
-                RangeStartWrapper::new(range_to_remove.end.clone()..stored_range.range.end),
+                range_to_remove.end.clone()..stored_range.end,
                 stored_value,
             );
         }
@@ -476,7 +458,7 @@ where
 ///
 /// [`iter`]: RangeMap::iter
 pub struct Iter<'a, K, V> {
-    inner: alloc::collections::btree_map::Iter<'a, RangeStartWrapper<K>, V>,
+    inner: alloc::collections::btree_map::Iter<'a, K, Inner<K, V>>,
 }
 
 impl<'a, K, V> Iterator for Iter<'a, K, V>
@@ -484,12 +466,12 @@ where
     K: 'a,
     V: 'a,
 {
-    type Item = (&'a Range<K>, &'a V);
+    type Item = (Range<&'a K>, &'a V);
 
-    fn next(&mut self) -> Option<(&'a Range<K>, &'a V)> {
+    fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .next()
-            .map(|(by_start, v)| (&by_start.end_wrapper.range, v))
+            .map(|(start, inner)| (&start..&inner.end, &inner.value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
